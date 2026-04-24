@@ -1,0 +1,16 @@
+[project]
+name = "slack-summarizer"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "anthropic>=0.39",
+    "fastapi>=0.110",
+    "modal>=1.4.2",
+    "notebooklm-py[browser]>=0.3.4",
+    "pydantic>=2.7",
+    "python-dateutil>=2.9",
+    "slack-bolt>=1.18",
+    "slack-sdk>=3.27",
+]

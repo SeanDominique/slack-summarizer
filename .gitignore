@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info/
+.python-version
+
+# Virtual environments
+.venv/
+
+# Secrets and auth — never commit these
+.env
+.env.local
+*.pem
+storage_state.json
+/tmp/nlm_auth.b64
+
+# Generated audio artifacts from smoke tests
+*.mp3
+
+# macOS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+*.swp

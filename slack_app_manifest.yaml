@@ -1,0 +1,76 @@
+# Paste this manifest into https://api.slack.com/apps → Create New App → From a manifest.
+#
+# Before creating:
+#   1. You'll replace every `REPLACE_WITH_MODAL_URL` with the public URL that
+#      `uv run modal deploy main.py` prints (looks like:
+#       https://seandominique--blok-digest-bot-slack-webhook.modal.run)
+#   2. If Slack rejects unknown URLs during creation, use a placeholder like
+#      https://example.com/slack/events — you can edit the real URLs in after
+#      Modal has deployed.
+#
+# After creation, in the Slack app config:
+#   - OAuth & Permissions → Install to Workspace → copy the Bot User OAuth Token
+#     (starts with xoxb-) into the `slack-creds` Modal secret
+#   - Basic Information → App Credentials → copy the Signing Secret into the
+#     same Modal secret
+#
+display_information:
+  name: Blok Digest
+  description: Morning Slack digests + on-demand deep research with podcast output.
+  background_color: "#1f2937"
+  long_description: >-
+    Blok Digest DMs each teammate a personalized morning summary of the last 24
+    hours of Slack activity, with a to-do list and hyperlinks to the source
+    messages. React to any message with :bookmark: to add it to your research
+    corpus; run /research since:YYYY-MM-DD to get an audio podcast synthesis
+    of everything you've bookmarked.
+features:
+  bot_user:
+    display_name: Blok Digest
+    always_online: true
+  slash_commands:
+    - command: /digest
+      url: https://REPLACE_WITH_MODAL_URL/slack/events
+      description: Daily Slack digest + to-dos in your DMs
+      usage_hint: "[on | off | timezone America/New_York]"
+      should_escape: false
+    - command: /research
+      url: https://REPLACE_WITH_MODAL_URL/slack/events
+      description: Podcast-form deep research over your :bookmark: reactions
+      usage_hint: "since:2026-03-01"
+      should_escape: false
+oauth_config:
+  scopes:
+    bot:
+      - channels:history
+      - channels:read
+      - groups:history
+      - groups:read
+      - im:history
+      - im:read
+      - im:write
+      - mpim:history
+      - mpim:read
+      - users:read
+      - chat:write
+      - chat:write.public
+      - commands
+      - reactions:read
+      - files:write
+      - app_mentions:read
+settings:
+  event_subscriptions:
+    request_url: https://REPLACE_WITH_MODAL_URL/slack/events
+    bot_events:
+      - reaction_added
+      - reaction_removed
+      - message.channels
+      - message.groups
+      - message.im
+      - message.mpim
+      - app_mention
+  interactivity:
+    is_enabled: false
+  org_deploy_enabled: false
+  socket_mode_enabled: false
+  token_rotation_enabled: false
