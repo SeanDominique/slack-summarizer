@@ -17,6 +17,9 @@ wheels/
 storage_state.json
 /tmp/nlm_auth.b64
 
+# Per-installer artifacts
+generated_manifest.yaml
+
 # Generated audio artifacts from smoke tests
 *.mp3
 

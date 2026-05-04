@@ -1,192 +1,171 @@
 # Blok Digest Bot
 
-A Slack bot that (a) DMs each teammate a personalized morning Slack digest with
-action items + message hyperlinks, and (b) on demand, synthesizes the messages
-they've bookmarked (via `:bookmark:` reaction) into an audio podcast via
-NotebookLM.
+A self-hosted Slack bot that DMs you a personalized morning digest of your last
+24 hours of Slack — themes + a to-do list with deep links back to the source
+messages. Plus: react any message with :bookmark:, then run `/research
+since:2026-03-01` to get an audio podcast synthesizing every bookmark you've
+piled up since that date.
 
-Design doc:
-`~/.gstack/projects/slack-summarizer/seandominique-main-design-20260423-230925.md`
+Each user runs their own copy in their own Slack workspace. No central server,
+no shared accounts, no marketplace listing. You pay your own Anthropic /
+Modal / Google bills (typically ~$25–$35/month for a 20-person team).
 
----
+## What you'll need
 
-## Status
+Before you start (~15 minutes total to gather these):
 
-| Step (per design doc Build Order) | State |
-|---|---|
-| 1. NotebookLM smoke test (local + Modal) | ✅ done |
-| 2. Slack App scaffolding | ⚠️ code ready; Slack App creation + deploy pending |
-| 3. Feature 1 fetch + filter + delimiter wrapping | ✅ code scaffold |
-| 4. Daily digest prompt tuning | ⚠️ v1 draft in `prompts/daily_digest.md`; needs 12–15h tuning on real data |
-| 5. Schedule + state + idempotency | ✅ code scaffold |
-| 6. Reaction event accumulator | ✅ code scaffold |
-| 7. Feature 2 fetch + cluster + synthesize | ✅ code scaffold |
-| 8. Feature 2 NotebookLM integration | ✅ code scaffold (smoke-tested) |
-| 9. Reliability pass + dogfood | pending |
-| 10. Ship | pending |
+| | What | How |
+|---|---|---|
+| 1 | A Slack workspace where you're an admin | Your personal workspace works |
+| 2 | An [Anthropic API key](https://console.anthropic.com/settings/keys) | 2 min to create; needs a credit card on file |
+| 3 | A free [Modal account](https://modal.com/signup) | Hosts the bot. Free tier covers personal use |
+| 4 | A Google account with [NotebookLM access](https://notebooklm.google.com) | Used by `/research` to generate the audio podcasts |
+| 5 | [`uv`](https://docs.astral.sh/uv/) installed locally | One command: `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
+| 6 | Python 3.12+ (`uv` will install it for you if missing) | |
 
----
+## Install
+
+```bash
+# 1. Clone
+git clone https://github.com/SeanDominique/slack-summarizer.git
+cd slack-summarizer
+
+# 2. Install dependencies
+uv sync
+
+# 3. Sign into NotebookLM (opens a browser; sign into your Google account)
+uv run notebooklm login
+uv run notebooklm auth check --test
+
+# 4. Sign into Modal (opens a browser; create account if needed)
+uv run modal setup
+
+# 5. Run the interactive installer
+uv run python setup.py
+```
+
+The `setup.py` script:
+- Creates the Modal secrets it needs (Anthropic key, your NotebookLM cookie)
+- Deploys the bot to Modal so you can get the public webhook URL
+- Generates a `generated_manifest.yaml` with that URL filled in for Slack
+- Walks you through creating the Slack App from the manifest, getting the
+  bot token + signing secret
+- Adds those to Modal and redeploys
+
+It then prints the final 3 manual steps in the Slack UI (event subscriptions,
+reinstall app, test) — you'll do those last bits in your browser.
+
+Total time, end to end: ~15-20 minutes. Most of it is waiting for the Modal
+image to build the first time.
+
+## Test it
+
+After setup completes, in any Slack channel or DM:
+
+```
+/digest on        # opt yourself in to the morning DM
+/digest           # send a digest right now to your DMs
+```
+
+To test the research feature:
+
+```
+React to a few messages with :bookmark:
+/research since:2026-04-01
+```
+
+You'll get an ephemeral ack within 1 second, and the actual digest / podcast
+DM lands ~30s for digest, 3-10 min for research.
+
+## Re-deploys
+
+After editing the code (e.g. tuning a prompt):
+
+```bash
+uv run modal deploy main.py
+```
+
+Hot-swap, no Slack reconfiguration needed.
 
 ## Architecture
 
 ```
-main.py                   Modal app: webhook (Slack Bolt), cron, spawned functions
-slack_client.py           Slack Web API wrappers (fetch, send, getPermalink)
-digest.py                 Daily digest: fetch → filter → wrap → Claude → validate → DM
-research.py               Reaction-bookmarked research: cluster → parallel → synthesize
-notebooklm_integration.py Production NotebookLM wrapper (cookie restore + podcast gen)
-state.py                  Modal Dict wrappers: users, reactions_index, rate-limit
-validate.py               Permalink normalization + citation validator
+Slack workspace
+   │ slash commands + events
+   ▼
+Modal webhook (FastAPI + Slack Bolt)
+   │
+   ├─► Cron (weekday 09:00 local) → spawns per-user digest function
+   │     └─► Slack Web API   ─►  Claude Sonnet (summarize + extract todos)
+   │           ─►  Block Kit DM with deep links
+   │
+   └─► /research command → spawns research function
+         └─► reactions index → cluster (Claude) → fan-out summaries (Claude, parallel)
+              ─►  synthesis (Claude) → NotebookLM (audio gen) → DM .mp3
+```
+
+State lives in Modal Dicts (per-user prefs, reactions index, rate-limit bucket).
+No external database. The full design doc is at
+`~/.gstack/projects/slack-summarizer/seandominique-main-design-20260423-230925.md`
+in the original developer's workspace if you want the rationale for every
+decision.
+
+## Things that will trip you up
+
+- **NotebookLM cookie expires roughly weekly.** When `/research` starts failing
+  with `NotebookLMError: NotebookLM generation failed`, run `uv run notebooklm
+  login` again, then re-run `uv run python setup.py` (it'll skip the steps you
+  already did and just refresh the cookie).
+- **The bot can't see channels it isn't a member of.** Invite the bot to every
+  channel you want digested. `/invite @blok_digest` in each channel.
+- **The bot can't see Slack messages bookmarked before it was installed.** The
+  reactions index only captures bookmarks from install forward.
+- **`notebooklm-py` is unofficial.** It uses undocumented Google APIs that can
+  break with no warning. If `/research` is broken for everyone, check the
+  [notebooklm-py issue tracker](https://github.com/teng-lin/notebooklm-py/issues).
+
+## Costs
+
+At a 20-person team running daily digests + ~50 research sessions/month:
+
+| | Estimate |
+|---|---|
+| Anthropic API (Sonnet 4.x) | ~$25-30/month |
+| Modal compute | $0 on free tier; ~$5/month if you exceed |
+| NotebookLM | $0 (consumer Google account) |
+| **Total** | **~$25-35/month** |
+
+Lower if it's just you. Anthropic billing kicks in based on tokens, so a quiet
+Slack costs less.
+
+## Privacy
+
+This bot reads your Slack messages and sends them to Anthropic's Claude API to
+summarize. Your team should know this before you install. Reaction-bookmarked
+messages additionally pass through your Google account's NotebookLM. No data
+goes anywhere else (no logging service, no analytics, nothing leaves your
+Modal account).
+
+## Layout
+
+```
+main.py                   Modal app: webhook, cron, spawned digest/research fns
+setup.py                  Interactive installer (run this first)
+slack_app_manifest.yaml   Slack App definition (template)
+slack_client.py           Slack API wrappers
+digest.py                 Daily digest pipeline
+research.py               Reaction-bookmarked research pipeline
+notebooklm_integration.py NotebookLM wrapper with text-fallback
+state.py                  Modal Dict wrappers (users, reactions, rate-limit)
+validate.py               Citation validator (drops hallucinated permalinks)
 prompts/
-  daily_digest.md         Load-bearing prompt for Feature 1 (needs tuning)
-  cluster_themer.md       Feature 2 step 1 — cluster bookmarked messages
-  theme_summarizer.md     Feature 2 step 2 — per-theme deep summary
-slack_app_manifest.yaml   Paste into Slack API console
-modal_smoke_test.py       Phase-2 NotebookLM smoke test (Modal egress)
-notebooklm_smoke_test.py  Phase-1 NotebookLM smoke test (local)
+  daily_digest.md         Load-bearing Feature 1 prompt — tune this on real data
+  cluster_themer.md       Feature 2 step 1
+  theme_summarizer.md     Feature 2 step 2
+notebooklm_smoke_test.py  Local NotebookLM smoke test
+modal_smoke_test.py       Modal-egress NotebookLM smoke test
 ```
 
----
+## License
 
-## Deploy (first time)
-
-### 1. Create the Slack App
-
-Go to https://api.slack.com/apps → **Create New App** → **From a manifest** → pick
-the Blok workspace. Paste `slack_app_manifest.yaml`. If Slack complains about the
-`REPLACE_WITH_MODAL_URL` placeholders, swap them for any valid URL (e.g.
-`https://example.com/slack/events`) just to get the app created; you'll fix them in
-step 4.
-
-### 2. Install to Workspace + grab credentials
-
-In the Slack app config:
-
-- **OAuth & Permissions** → Install to Workspace → copy the **Bot User OAuth Token**
-  (starts with `xoxb-`).
-- **Basic Information** → App Credentials → copy the **Signing Secret**.
-
-### 3. Create Modal Secrets
-
-```bash
-uv run modal secret create slack-creds \
-  SLACK_BOT_TOKEN=xoxb-... \
-  SLACK_SIGNING_SECRET=...
-
-uv run modal secret create anthropic \
-  ANTHROPIC_API_KEY=sk-ant-...
-
-# notebooklm-auth should already exist from the Phase 2 smoke test.
-# If it doesn't, re-create it:
-base64 -i ~/.notebooklm/storage_state.json | tr -d '\n' > /tmp/nlm_auth.b64
-uv run modal secret create notebooklm-auth \
-  NOTEBOOKLM_STORAGE_STATE_B64=$(cat /tmp/nlm_auth.b64)
-rm /tmp/nlm_auth.b64
-```
-
-### 4. Deploy the app
-
-```bash
-uv run modal deploy main.py
-```
-
-Modal prints the webhook URL. Looks like:
-`https://seandominique--blok-digest-bot-slack-webhook.modal.run`
-
-### 5. Wire the URL back into Slack
-
-In the Slack app config:
-
-- **Slash Commands** → edit each (`/digest`, `/research`) → set Request URL to
-  `https://<modal-url>/slack/events`.
-- **Event Subscriptions** → set Request URL to the same. Slack sends a challenge
-  request; Bolt handles it. The URL should verify green.
-- **Install App** (top of sidebar) → Reinstall to Workspace to pick up any scope
-  changes.
-
-### 6. Smoke-test in Slack
-
-In any channel or DM with the bot:
-
-```
-/digest on
-/digest
-```
-
-You should see:
-- Ephemeral ack: "🌅 On it — digest coming to your DMs in ~60s."
-- ~60s later: a DM with a morning digest (even if sparse).
-
-Then test the reaction path:
-
-```
-React to any message in a channel the bot is in with :bookmark:
-/research since:2026-04-01
-```
-
-You should see:
-- Ephemeral ack: "🎧 On it — fetching your :bookmark: messages..."
-- ~3-10 min later: a DM with an MP3 attached (or a markdown fallback if
-  NotebookLM failed).
-
----
-
-## Updating
-
-```bash
-uv run modal deploy main.py
-```
-
-Modal hot-swaps the webhook with zero downtime. Slack doesn't need to be touched
-again.
-
-## Checking logs
-
-```bash
-uv run modal app logs blok-digest-bot
-```
-
-Or view in the UI: https://modal.com/apps/<your-username>/main
-
-## Tuning the prompts
-
-The `prompts/daily_digest.md` is the most important file in this repo. Plan to
-spend 12–15 hours tuning it against 5+ real days of your own Slack data. The
-pattern:
-
-1. Run `uv run modal run main.py::run_once --user-id U-YOUR-ID`
-2. Read the DM it sent you critically. Which todos are wrong? Which real todos
-   did it miss? Which themes felt off?
-3. Edit `prompts/daily_digest.md` with sharper rules.
-4. `uv run modal deploy main.py`
-5. Repeat.
-
-The citation validator in `validate.py` will silently drop any todo where Claude
-hallucinated a permalink. Watch for that in the logs — if the `dropped_count` is
-consistently >0, Claude is paraphrasing URLs and the prompt needs tightening.
-
----
-
-## Known limitations (acknowledged in the design doc)
-
-- **Messages bookmarked before install aren't indexed.** The reaction-added
-  accumulator only captures reactions from install forward. Bookmarks from
-  earlier don't appear in `/research` output.
-- **@mentions only come from channels the bot is in.** If a user is @mentioned
-  in a channel the bot isn't a member of, the digest misses it.
-- **NotebookLM cookie rotation.** Google rotates session cookies roughly weekly.
-  When `/research` starts failing with a `NotebookLMError`, re-run
-  `notebooklm login` locally and refresh the `notebooklm-auth` Modal secret.
-- **Prompt tuning is a you-shaped activity.** No amount of scaffolding replaces
-  reading real digest output and iterating. Budget the full 12–15h.
-
----
-
-## Tearing it down
-
-```bash
-uv run modal app stop blok-digest-bot
-```
-
-In the Slack app config, delete the app (Settings → Basic Information →
-scroll to the bottom).
+MIT — see [LICENSE](LICENSE).

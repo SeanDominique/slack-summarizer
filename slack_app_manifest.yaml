@@ -1,29 +1,24 @@
-# Paste this manifest into https://api.slack.com/apps → Create New App → From a manifest.
+# Blok Digest Bot — Slack App Manifest
 #
-# Before creating:
-#   1. You'll replace every `REPLACE_WITH_MODAL_URL` with the public URL that
-#      `uv run modal deploy main.py` prints (looks like:
-#       https://seandominique--blok-digest-bot-slack-webhook.modal.run)
-#   2. If Slack rejects unknown URLs during creation, use a placeholder like
-#      https://example.com/slack/events — you can edit the real URLs in after
-#      Modal has deployed.
+# `setup.py` will generate `generated_manifest.yaml` from this file with the
+# real Modal webhook URL substituted in. Use the generated file when creating
+# the Slack App.
 #
-# After creation, in the Slack app config:
-#   - OAuth & Permissions → Install to Workspace → copy the Bot User OAuth Token
-#     (starts with xoxb-) into the `slack-creds` Modal secret
-#   - Basic Information → App Credentials → copy the Signing Secret into the
-#     same Modal secret
+# Note: event_subscriptions are intentionally NOT in this manifest. Slack
+# verifies the events request_url at app-creation time, which fails before our
+# real Slack signing secret is wired. Setup tells you to add events in the
+# Slack UI after deploy completes.
 #
 display_information:
   name: Blok Digest
   description: Morning Slack digests + on-demand deep research with podcast output.
   background_color: "#1f2937"
-  long_description: >-
-    Blok Digest DMs each teammate a personalized morning summary of the last 24
-    hours of Slack activity, with a to-do list and hyperlinks to the source
-    messages. React to any message with :bookmark: to add it to your research
-    corpus; run /research since:YYYY-MM-DD to get an audio podcast synthesis
-    of everything you've bookmarked.
+  long_description: |
+    Blok Digest DMs you a personalized morning summary of the last 24 hours of
+    Slack activity, with a to-do list and hyperlinks to the source messages.
+    React to any message with the bookmark emoji to add it to your research
+    corpus; run /research to get an audio podcast synthesis of everything you
+    have bookmarked.
 features:
   bot_user:
     display_name: Blok Digest
@@ -36,7 +31,7 @@ features:
       should_escape: false
     - command: /research
       url: https://REPLACE_WITH_MODAL_URL/slack/events
-      description: Podcast-form deep research over your :bookmark: reactions
+      description: "Podcast deep research over your :bookmark: reactions"
       usage_hint: "since:2026-03-01"
       should_escape: false
 oauth_config:
@@ -59,16 +54,6 @@ oauth_config:
       - files:write
       - app_mentions:read
 settings:
-  event_subscriptions:
-    request_url: https://REPLACE_WITH_MODAL_URL/slack/events
-    bot_events:
-      - reaction_added
-      - reaction_removed
-      - message.channels
-      - message.groups
-      - message.im
-      - message.mpim
-      - app_mention
   interactivity:
     is_enabled: false
   org_deploy_enabled: false
