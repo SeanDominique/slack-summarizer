@@ -106,24 +106,39 @@ def run_user_research(user_id: str, since_epoch: float, since_date_str: str) -> 
     user_name = result["user_name"]
     doc_md = result["document_markdown"]
 
-    # Try NotebookLM; fall back to text-only if it breaks.
+    # Generate podcast. The integration always returns a result with a notebook
+    # URL the user can visit; download_error is set if MP3 download failed.
+    # Only NotebookLMError (auth/library failure) means we have nothing.
     try:
-        podcast_bytes = notebooklm_integration.generate_podcast_sync(
+        podcast = notebooklm_integration.generate_podcast_sync(
             source_title=f"Blok Digest — bookmarks since {since_date_str}",
             source_markdown=doc_md,
             notebook_name=f"{user_name} — bookmarks since {since_date_str}",
         )
-        _dm_research_success_podcast(
-            user_id, user_name, since_date_str, podcast_bytes, doc_md, result
+    except notebooklm_integration.NotebookLMError as exc:
+        log.warning("NotebookLM auth/init failed for %s: %s", user_id, exc)
+        _dm_research_text_only(user_id, user_name, since_date_str, doc_md, result)
+        result["delivery"] = "text_only"
+        result["notebooklm_error"] = str(exc)
+        return result
+
+    if podcast.audio_bytes is not None:
+        _dm_research_with_podcast(
+            user_id, user_name, since_date_str,
+            podcast.audio_bytes, podcast.notebook_url, doc_md, result,
         )
         result["delivery"] = "podcast"
-    except notebooklm_integration.NotebookLMError as exc:
-        log.warning("NotebookLM failed for %s: %s", user_id, exc)
-        _dm_research_success_text_fallback(
-            user_id, user_name, since_date_str, doc_md, result
+    else:
+        log.info(
+            "MP3 download failed for %s (%s); sending notebook URL fallback",
+            user_id, podcast.download_error,
         )
-        result["delivery"] = "text_fallback"
-        result["notebooklm_error"] = str(exc)
+        _dm_research_with_url_only(
+            user_id, user_name, since_date_str,
+            podcast.notebook_url, doc_md, result,
+        )
+        result["delivery"] = "url_fallback"
+        result["notebooklm_download_error"] = podcast.download_error
 
     return result
 
@@ -147,22 +162,24 @@ def _dm_research_failure(user_id: str, status: str) -> None:
     slack_client.post_dm(user_id, msg)
 
 
-def _dm_research_success_podcast(
-    user_id: str, user_name: str, since_date: str,
-    podcast_bytes: bytes, doc_md: str, result: dict
-) -> None:
-    import slack_client
-    import os
-    from slack_sdk import WebClient
-
-    # Upload podcast as a Slack file attached to the DM
-    wc = WebClient(token=os.environ["SLACK_BOT_TOKEN"])
-    dm = wc.conversations_open(users=user_id)
-    channel = dm["channel"]["id"]
-    truncated_note = (
+def _truncated_note(result: dict) -> str:
+    return (
         "\n_Note: your corpus was capped at 200 messages — run again with a narrower `since:` for the rest._"
         if result.get("was_truncated") else ""
     )
+
+
+def _dm_research_with_podcast(
+    user_id: str, user_name: str, since_date: str,
+    podcast_bytes: bytes, notebook_url: str, doc_md: str, result: dict,
+) -> None:
+    """Happy path: MP3 attached to the DM. Notebook URL included as a bonus."""
+    import os
+    from slack_sdk import WebClient
+
+    wc = WebClient(token=os.environ["SLACK_BOT_TOKEN"])
+    dm = wc.conversations_open(users=user_id)
+    channel = dm["channel"]["id"]
     wc.files_upload_v2(
         channel=channel,
         content=podcast_bytes,
@@ -170,16 +187,22 @@ def _dm_research_success_podcast(
         title=f"🎧 {user_name} bookmarks since {since_date}",
         initial_comment=(
             f"Your research podcast is ready — {result['theme_count']} themes across "
-            f"{result['corpus_size']} bookmarked messages.{truncated_note}"
+            f"{result['corpus_size']} bookmarked messages."
+            f"{_truncated_note(result)}\n"
+            f"Listen here in Slack, or open in NotebookLM: <{notebook_url}>"
         ),
     )
 
 
-def _dm_research_success_text_fallback(
+def _dm_research_with_url_only(
     user_id: str, user_name: str, since_date: str,
-    doc_md: str, result: dict
+    notebook_url: str, doc_md: str, result: dict,
 ) -> None:
-    import slack_client
+    """The notebook + audio exists in NotebookLM but our MP3 download failed.
+
+    Send the URL so the user can listen directly in NotebookLM's web app, plus
+    attach the markdown synthesis as a backup.
+    """
     import os
     from slack_sdk import WebClient
 
@@ -192,10 +215,42 @@ def _dm_research_success_text_fallback(
         filename=f"bookmarks-since-{since_date}.md",
         title=f"📄 {user_name} bookmarks since {since_date}",
         initial_comment=(
-            "Research synthesis is ready. The podcast generation step failed so "
-            "you're getting the markdown instead — paste it into NotebookLM manually "
-            f"if you want the audio. {result['theme_count']} themes across "
-            f"{result['corpus_size']} messages."
+            f"🎧 *Your research podcast is ready in NotebookLM:* <{notebook_url}>\n"
+            f"Click that link to listen — the audio lives in your own NotebookLM account.\n\n"
+            f"_(Heads up: I couldn't pull the MP3 file directly into Slack this time, "
+            f"so I'm linking the notebook instead. Markdown synthesis attached as a "
+            f"backup.)_\n"
+            f"{result['theme_count']} themes across {result['corpus_size']} bookmarked "
+            f"messages.{_truncated_note(result)}"
+        ),
+    )
+
+
+def _dm_research_text_only(
+    user_id: str, user_name: str, since_date: str,
+    doc_md: str, result: dict,
+) -> None:
+    """Worst case: no notebook was created at all (auth/library failure).
+
+    Send markdown only, with instructions for manual NotebookLM use.
+    """
+    import os
+    from slack_sdk import WebClient
+
+    wc = WebClient(token=os.environ["SLACK_BOT_TOKEN"])
+    dm = wc.conversations_open(users=user_id)
+    channel = dm["channel"]["id"]
+    wc.files_upload_v2(
+        channel=channel,
+        content=doc_md.encode("utf-8"),
+        filename=f"bookmarks-since-{since_date}.md",
+        title=f"📄 {user_name} bookmarks since {since_date}",
+        initial_comment=(
+            f"Research synthesis is ready. NotebookLM integration failed entirely "
+            f"this time, so I'm only sending the markdown. Paste it into "
+            f"https://notebooklm.google.com manually if you want the audio. "
+            f"{result['theme_count']} themes across {result['corpus_size']} messages."
+            f"{_truncated_note(result)}"
         ),
     )
 

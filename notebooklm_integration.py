@@ -2,24 +2,25 @@
 
 Restores the Google session cookie from a Modal secret into ~/.notebooklm/ at
 runtime, submits the synthesis document as a pasted-text source, generates an
-audio overview, and returns the local MP3 bytes.
+audio overview, and returns a `PodcastResult` containing the notebook URL and
+(when downloadable) the MP3 bytes.
 
-Two notes from real-world use:
+Failure mode strategy:
+    - If we can create the notebook + add the source, we always have a usable
+      URL pointing at the notebook in NotebookLM's web app. Even if our MP3
+      download fails, the user can click that URL and listen there directly.
+    - The download polling has historically been brittle (notebooklm-py's own
+      `wait_for_completion` has a known issue where it hangs on the
+      `_is_media_ready` check, and `Artifact.status` is an int, not a string).
+      So we always return a URL-bearing result rather than raising — the
+      caller decides the DM format.
+    - Only raise `NotebookLMError` when notebook creation itself fails (auth
+      broken, library import error, etc.) — those are real failures with no
+      fallback path.
 
-1. We do NOT use `client.artifacts.wait_for_completion()`. That helper runs
-   `poll_status()` which calls `_is_media_ready()` — a check that demands the
-   internal media URL field be populated before reporting COMPLETED. That field
-   sometimes lags behind the actual completion by 5+ minutes (audio shows up in
-   the NotebookLM UI but the polling helper still says "processing"). Our
-   workaround is to poll `list_audio()` ourselves and just try
-   `download_audio()` directly, which only requires status==COMPLETED.
-
-2. We request `AudioLength.SHORT` + `AudioFormat.BRIEF` by default — the
-   library's default produces 15+ minute podcasts which is overkill for typical
-   bookmark synthesis (a few hundred words of content).
-
-On any failure (timeout, auth, library breakage) the caller is expected to
-fall back to DMing the markdown synthesis.
+Defaults: `AudioLength.SHORT` + `AudioFormat.BRIEF` produces ~2-5 min podcasts.
+NotebookLM's default is LONG (~15 min) which is overkill for bookmark
+synthesis.
 """
 
 from __future__ import annotations
@@ -28,11 +29,27 @@ import asyncio
 import base64
 import logging
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 from notebooklm import NotebookLMClient
 from notebooklm.rpc.types import ArtifactStatus, AudioFormat, AudioLength
 from notebooklm.types import ArtifactNotReadyError, ArtifactParseError
+
+
+@dataclass
+class PodcastResult:
+    """Outcome of a podcast generation attempt.
+
+    notebook_url is always present (the notebook always exists if we reached
+    the point of returning). audio_bytes is present iff the MP3 download
+    succeeded — when it's None, the caller should DM the URL and let the user
+    play the audio in NotebookLM's web app.
+    """
+    notebook_id: str
+    notebook_url: str
+    audio_bytes: bytes | None
+    download_error: str | None  # populated if audio_bytes is None
 
 log = logging.getLogger(__name__)
 
@@ -116,6 +133,10 @@ async def _wait_then_download(client, notebook_id: str, target_task_id: str | No
         interval = min(interval * 1.5, POLL_MAX_S)
 
 
+def _notebook_url(notebook_id: str) -> str:
+    return f"https://notebooklm.google.com/notebook/{notebook_id}"
+
+
 async def generate_podcast(
     source_title: str,
     source_markdown: str,
@@ -123,51 +144,107 @@ async def generate_podcast(
     instructions: str = "Keep it concise — match length to substance.",
     audio_length: AudioLength = AudioLength.SHORT,
     audio_format: AudioFormat = AudioFormat.BRIEF,
-) -> bytes:
-    """Returns the MP3 bytes. Raises NotebookLMError on any failure.
+) -> PodcastResult:
+    """Generate a podcast and return a PodcastResult.
+
+    Always returns a result if notebook creation succeeded — never raises on
+    download/timeout failures. Caller checks `audio_bytes` and `download_error`
+    to decide DM format.
+
+    Raises NotebookLMError ONLY if we couldn't even create the notebook
+    (auth/library failure with no fallback path).
 
     Defaults: SHORT length (~2-5 min) + BRIEF format. Override for richer
     corpora.
     """
     _restore_auth_from_env()
 
+    # Phase 1: notebook + source. Failures here are unrecoverable.
     try:
-        async with await NotebookLMClient.from_storage() as client:
-            nb = await client.notebooks.create(notebook_name)
-            log.info("created notebook %s", nb.id)
+        client_ctx = NotebookLMClient.from_storage()
+        client = await client_ctx
+    except Exception as e:
+        raise NotebookLMError(f"NotebookLM auth/init failed: {e!r}") from e
 
-            await client.sources.add_text(
-                nb.id, source_title, source_markdown, wait=True
-            )
-            log.info("added source to %s", nb.id)
+    try:
+        async with client:
+            try:
+                nb = await client.notebooks.create(notebook_name)
+                log.info("created notebook %s", nb.id)
+                await client.sources.add_text(
+                    nb.id, source_title, source_markdown, wait=True
+                )
+                log.info("added source to notebook %s", nb.id)
+            except Exception as e:
+                raise NotebookLMError(
+                    f"Failed to create notebook + source: {e!r}"
+                ) from e
 
-            status = await client.artifacts.generate_audio(
-                nb.id,
-                instructions=instructions,
-                audio_format=audio_format,
-                audio_length=audio_length,
-            )
-            log.info(
-                "audio generation kicked off task=%s; polling for completion",
-                status.task_id,
-            )
+            url = _notebook_url(nb.id)
 
-            out_path = "/tmp/podcast.mp3"
-            await _wait_then_download(client, nb.id, status.task_id, out_path)
-            return Path(out_path).read_bytes()
+            # Phase 2: kick off audio generation. If this fails, we still have
+            # a notebook URL the user can visit (and manually click "Generate
+            # Audio Overview" themselves if needed).
+            try:
+                status = await client.artifacts.generate_audio(
+                    nb.id,
+                    instructions=instructions,
+                    audio_format=audio_format,
+                    audio_length=audio_length,
+                )
+                log.info(
+                    "audio generation kicked off task=%s; polling for completion",
+                    status.task_id,
+                )
+            except Exception as e:
+                log.warning("generate_audio kickoff failed: %r", e)
+                return PodcastResult(
+                    notebook_id=nb.id,
+                    notebook_url=url,
+                    audio_bytes=None,
+                    download_error=f"audio kickoff failed: {e!r}",
+                )
+
+            # Phase 3: poll + download. If anything fails, fall back to URL.
+            try:
+                out_path = "/tmp/podcast.mp3"
+                await _wait_then_download(client, nb.id, status.task_id, out_path)
+                audio_bytes = Path(out_path).read_bytes()
+                return PodcastResult(
+                    notebook_id=nb.id,
+                    notebook_url=url,
+                    audio_bytes=audio_bytes,
+                    download_error=None,
+                )
+            except NotebookLMError as e:
+                # Polling timed out, but the audio likely exists in the
+                # notebook UI. URL fallback gives the user a working path.
+                log.info("download fell back to URL-only: %s", e)
+                return PodcastResult(
+                    notebook_id=nb.id,
+                    notebook_url=url,
+                    audio_bytes=None,
+                    download_error=str(e),
+                )
+            except Exception as e:
+                log.warning("unexpected error during download: %r", e)
+                return PodcastResult(
+                    notebook_id=nb.id,
+                    notebook_url=url,
+                    audio_bytes=None,
+                    download_error=f"unexpected: {e!r}",
+                )
     except NotebookLMError:
         raise
-    except asyncio.TimeoutError as e:
-        raise NotebookLMError(f"NotebookLM timeout: {e}") from e
     except Exception as e:
-        raise NotebookLMError(f"NotebookLM generation failed: {e!r}") from e
+        raise NotebookLMError(f"NotebookLM session error: {e!r}") from e
 
 
 def generate_podcast_sync(
     source_title: str,
     source_markdown: str,
     notebook_name: str,
-) -> bytes:
+) -> PodcastResult:
     """Sync entrypoint for Modal functions that aren't declared async."""
     return asyncio.run(
         generate_podcast(source_title, source_markdown, notebook_name)
