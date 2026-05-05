@@ -79,15 +79,12 @@ def _restore_auth_from_env() -> None:
 async def _wait_then_download(client, notebook_id: str, target_task_id: str | None, out_path: str) -> None:
     """Poll until an audio artifact for this notebook is downloadable, then save it.
 
+    Uses print() instead of logging because Modal captures stdout reliably;
+    its default log level filters out INFO from the standard logging module.
+
     Skips `wait_for_completion()` to dodge the `_is_media_ready` polling bug.
-
-    Logic: every N seconds, list audio artifacts; once any has the COMPLETED
-    status code (integer 3, NOT a string), try `download_audio()`. If
-    `ArtifactNotReadyError` or `ArtifactParseError` fires (URL field not yet
-    populated even though status is COMPLETED), wait and retry.
-
-    NB: Artifact.status is an int (ArtifactStatus enum). Comparing strings
-    silently fails — that bug ate 15 minutes of polling on the previous run.
+    Logic: every N seconds, list audio artifacts; once any has status code 3
+    (ArtifactStatus.COMPLETED — int, not string), try `download_audio()`.
     """
     start = asyncio.get_running_loop().time()
     interval = POLL_INITIAL_S
@@ -104,30 +101,32 @@ async def _wait_then_download(client, notebook_id: str, target_task_id: str | No
         try:
             audios = await client.artifacts.list_audio(notebook_id)
         except Exception as exc:
-            log.warning("list_audio failed mid-poll: %s — retrying", exc)
+            print(f"[nlm] list_audio raised {exc!r} — retrying", flush=True)
             audios = []
 
         poll_count += 1
-        # Lightweight log every poll so debugging future failures is cheap.
         statuses = [(a.id[:8], int(a.status)) for a in audios]
-        log.info(
-            "poll #%d (%.0fs elapsed): %d audio artifact(s) %s",
-            poll_count, elapsed, len(audios), statuses,
+        print(
+            f"[nlm] poll #{poll_count} ({elapsed:.0f}s) → {len(audios)} audio artifact(s): {statuses}",
+            flush=True,
         )
 
         completed = [a for a in audios if int(a.status) == ArtifactStatus.COMPLETED.value]
         if completed:
             try:
                 await client.artifacts.download_audio(notebook_id, out_path)
-                log.info(
-                    "audio downloaded after %.1fs (artifact %s)",
-                    elapsed, completed[0].id[:8],
+                print(
+                    f"[nlm] download succeeded after {elapsed:.0f}s (artifact {completed[0].id[:8]})",
+                    flush=True,
                 )
                 return
             except (ArtifactNotReadyError, ArtifactParseError) as exc:
-                log.info("status COMPLETED but download not ready yet (%s); retrying", exc)
+                print(
+                    f"[nlm] status COMPLETED but URL not ready yet ({exc!r}); retrying",
+                    flush=True,
+                )
             except Exception as exc:
-                log.warning("download_audio raised %r — retrying", exc)
+                print(f"[nlm] download_audio raised {exc!r} — retrying", flush=True)
 
         await asyncio.sleep(interval)
         interval = min(interval * 1.5, POLL_MAX_S)
@@ -170,11 +169,11 @@ async def generate_podcast(
         async with client:
             try:
                 nb = await client.notebooks.create(notebook_name)
-                log.info("created notebook %s", nb.id)
+                print(f"[nlm] created notebook {nb.id}", flush=True)
                 await client.sources.add_text(
                     nb.id, source_title, source_markdown, wait=True
                 )
-                log.info("added source to notebook %s", nb.id)
+                print(f"[nlm] added source to notebook {nb.id}", flush=True)
             except Exception as e:
                 raise NotebookLMError(
                     f"Failed to create notebook + source: {e!r}"
@@ -182,28 +181,57 @@ async def generate_podcast(
 
             url = _notebook_url(nb.id)
 
-            # Phase 2: kick off audio generation. If this fails, we still have
-            # a notebook URL the user can visit (and manually click "Generate
-            # Audio Overview" themselves if needed).
-            try:
-                status = await client.artifacts.generate_audio(
-                    nb.id,
-                    instructions=instructions,
-                    audio_format=audio_format,
-                    audio_length=audio_length,
-                )
-                log.info(
-                    "audio generation kicked off task=%s; polling for completion",
-                    status.task_id,
-                )
-            except Exception as e:
-                log.warning("generate_audio kickoff failed: %r", e)
+            # Phase 2: kick off audio generation. Sometimes the API returns
+            # an empty task_id which means generation didn't actually queue.
+            # We retry up to 3 times with a small wait — the source file may
+            # need a moment to settle inside NotebookLM's indexing.
+            kickoff_attempts = 3
+            kickoff_error = None
+            status = None
+            for attempt in range(1, kickoff_attempts + 1):
+                try:
+                    print(
+                        f"[nlm] generate_audio attempt {attempt} "
+                        f"(format={audio_format.name}, length={audio_length.name})",
+                        flush=True,
+                    )
+                    status = await client.artifacts.generate_audio(
+                        nb.id,
+                        instructions=instructions,
+                        audio_format=audio_format,
+                        audio_length=audio_length,
+                    )
+                    print(
+                        f"[nlm] generate_audio returned task_id={status.task_id!r} "
+                        f"status={getattr(status, 'status', 'n/a')}",
+                        flush=True,
+                    )
+                except Exception as e:
+                    kickoff_error = f"{e!r}"
+                    print(f"[nlm] generate_audio raised {e!r} on attempt {attempt}", flush=True)
+                    status = None
+
+                if status is not None and status.task_id:
+                    break
+
+                if attempt < kickoff_attempts:
+                    print(f"[nlm] empty task_id on attempt {attempt} — sleeping 8s before retry", flush=True)
+                    await asyncio.sleep(8)
+
+            if status is None or not status.task_id:
+                err = kickoff_error or "generate_audio returned empty task_id"
+                print(f"[nlm] kickoff failed permanently: {err}", flush=True)
                 return PodcastResult(
                     notebook_id=nb.id,
                     notebook_url=url,
                     audio_bytes=None,
-                    download_error=f"audio kickoff failed: {e!r}",
+                    download_error=f"audio kickoff never queued: {err}",
                 )
+
+            print(
+                f"[nlm] audio generation kicked off task={status.task_id}; polling for completion",
+                flush=True,
+            )
 
             # Phase 3: poll + download. If anything fails, fall back to URL.
             try:
@@ -217,9 +245,7 @@ async def generate_podcast(
                     download_error=None,
                 )
             except NotebookLMError as e:
-                # Polling timed out, but the audio likely exists in the
-                # notebook UI. URL fallback gives the user a working path.
-                log.info("download fell back to URL-only: %s", e)
+                print(f"[nlm] download fell back to URL-only: {e}", flush=True)
                 return PodcastResult(
                     notebook_id=nb.id,
                     notebook_url=url,
@@ -227,7 +253,7 @@ async def generate_podcast(
                     download_error=str(e),
                 )
             except Exception as e:
-                log.warning("unexpected error during download: %r", e)
+                print(f"[nlm] unexpected error during download: {e!r}", flush=True)
                 return PodcastResult(
                     notebook_id=nb.id,
                     notebook_url=url,
