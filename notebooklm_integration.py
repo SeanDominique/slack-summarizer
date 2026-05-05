@@ -31,7 +31,7 @@ import os
 from pathlib import Path
 
 from notebooklm import NotebookLMClient
-from notebooklm.rpc.types import AudioFormat, AudioLength
+from notebooklm.rpc.types import ArtifactStatus, AudioFormat, AudioLength
 from notebooklm.types import ArtifactNotReadyError, ArtifactParseError
 
 log = logging.getLogger(__name__)
@@ -63,12 +63,18 @@ async def _wait_then_download(client, notebook_id: str, target_task_id: str | No
     """Poll until an audio artifact for this notebook is downloadable, then save it.
 
     Skips `wait_for_completion()` to dodge the `_is_media_ready` polling bug.
-    Logic: every N seconds, list audio artifacts; once any is COMPLETED, try
-    `download_audio()`. If `ArtifactNotReadyError` or `ArtifactParseError`
-    fires (URL not yet populated), wait and retry.
+
+    Logic: every N seconds, list audio artifacts; once any has the COMPLETED
+    status code (integer 3, NOT a string), try `download_audio()`. If
+    `ArtifactNotReadyError` or `ArtifactParseError` fires (URL field not yet
+    populated even though status is COMPLETED), wait and retry.
+
+    NB: Artifact.status is an int (ArtifactStatus enum). Comparing strings
+    silently fails — that bug ate 15 minutes of polling on the previous run.
     """
     start = asyncio.get_running_loop().time()
     interval = POLL_INITIAL_S
+    poll_count = 0
 
     while True:
         elapsed = asyncio.get_running_loop().time() - start
@@ -84,14 +90,25 @@ async def _wait_then_download(client, notebook_id: str, target_task_id: str | No
             log.warning("list_audio failed mid-poll: %s — retrying", exc)
             audios = []
 
-        completed = [a for a in audios if str(getattr(a, "status", "")).lower() == "completed"]
+        poll_count += 1
+        # Lightweight log every poll so debugging future failures is cheap.
+        statuses = [(a.id[:8], int(a.status)) for a in audios]
+        log.info(
+            "poll #%d (%.0fs elapsed): %d audio artifact(s) %s",
+            poll_count, elapsed, len(audios), statuses,
+        )
+
+        completed = [a for a in audios if int(a.status) == ArtifactStatus.COMPLETED.value]
         if completed:
             try:
                 await client.artifacts.download_audio(notebook_id, out_path)
-                log.info("audio downloaded after %.1fs", elapsed)
+                log.info(
+                    "audio downloaded after %.1fs (artifact %s)",
+                    elapsed, completed[0].id[:8],
+                )
                 return
             except (ArtifactNotReadyError, ArtifactParseError) as exc:
-                log.debug("download_audio not ready yet (%s); retrying", exc)
+                log.info("status COMPLETED but download not ready yet (%s); retrying", exc)
             except Exception as exc:
                 log.warning("download_audio raised %r — retrying", exc)
 
