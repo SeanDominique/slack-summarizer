@@ -25,6 +25,15 @@ from zoneinfo import ZoneInfo
 
 import modal
 
+# These need to be at module top, not inside slack_webhook(), because
+# `from __future__ import annotations` makes every type hint a string and
+# FastAPI's get_type_hints() resolves them against module globals — not
+# local scope. Hide them inside the asgi function and Request-injection
+# silently breaks (FastAPI falls back to treating `req` as a query param).
+from fastapi import FastAPI, Request
+from slack_bolt import App as BoltApp
+from slack_bolt.adapter.fastapi import SlackRequestHandler
+
 # ------- Image -------
 
 image = (
@@ -257,10 +266,6 @@ def _same_15min_window(target_hm: str, current_hm: str) -> bool:
 )
 @modal.asgi_app()
 def slack_webhook():
-    from fastapi import FastAPI, Request
-    from slack_bolt import App as BoltApp
-    from slack_bolt.adapter.fastapi import SlackRequestHandler
-
     bolt = BoltApp(
         token=os.environ["SLACK_BOT_TOKEN"],
         signing_secret=os.environ["SLACK_SIGNING_SECRET"],
