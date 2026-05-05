@@ -202,12 +202,13 @@ SYNTHESIS_SYSTEM = """You are merging per-theme summaries into a single cohesive
 research document that will be passed to NotebookLM to generate an audio podcast.
 
 ## Rules
-- Preserve the individual `## Theme` sections verbatim — do not rewrite them.
-- Add a short intro paragraph (3-4 sentences) naming the overall subject matter.
-- Add a short closing paragraph (2-3 sentences) noting what's still open.
-- Keep the document to 1500-3000 words total. If inputs exceed this, trust them and
-  pass through — don't prune the summaries.
-- No meta-commentary.
+- Preserve the individual `## Theme` sections VERBATIM — do not rewrite them.
+- Add a short intro paragraph (1-3 sentences) naming the overall subject matter.
+- DO NOT add an "Open Questions" or "What's still unclear" section. If something
+  isn't in the messages, don't manufacture content about its absence.
+- Length tracks the input. Two short themes → a short doc. Don't pad.
+- No meta-commentary. No "this document synthesizes...", "these snapshots
+  offer a window into...", etc. Just the content.
 
 Return the full markdown document, nothing else."""
 

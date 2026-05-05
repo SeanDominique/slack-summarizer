@@ -4,8 +4,10 @@ Restores the Google session cookie from a Modal secret into ~/.notebooklm/ at
 runtime, submits the synthesis document as a pasted-text source, generates an
 audio overview, and returns the local MP3 bytes.
 
-Hard 5-minute generation timeout. On any failure (timeout, auth, library
-breakage) the caller is expected to fall back to DMing the markdown synthesis.
+Hard 15-minute generation timeout (real NotebookLM Audio Overview generation
+can take 5-15 min, especially via Modal's egress IPs). On any failure
+(timeout, auth, library breakage) the caller is expected to fall back to
+DMing the markdown synthesis.
 """
 
 from __future__ import annotations
@@ -20,7 +22,7 @@ from notebooklm import NotebookLMClient
 
 log = logging.getLogger(__name__)
 
-NOTEBOOKLM_TIMEOUT_S = 300.0
+NOTEBOOKLM_TIMEOUT_S = 900.0
 
 
 class NotebookLMError(Exception):
